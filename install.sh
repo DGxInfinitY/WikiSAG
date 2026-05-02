@@ -37,9 +37,11 @@ echo "[*] Building directory structure at $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 
-# 3. Download the Python Application (Removed -q so errors are visible)
-echo "[*] Downloading WikiSAG core..."
+# 3. Download the Python Application and Uninstaller
+echo "[*] Downloading WikiSAG core and utilities..."
 wget -O wikisag.py "https://raw.githubusercontent.com/DGxInfinitY/WikiSAG/master/wikisag.py"
+wget -O uninstall.sh "https://raw.githubusercontent.com/DGxInfinitY/WikiSAG/master/uninstall.sh"
+chmod +x uninstall.sh
 
 # 4. Build the Isolated Python Environment
 echo "[*] Creating Python Virtual Environment..."

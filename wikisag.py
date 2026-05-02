@@ -33,17 +33,15 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 # --- Auto-Download Logic ---
 def check_disk_space(required_gb, path="."):
-    """Checks if the target drive has enough free space."""
     total, used, free = shutil.disk_usage(path)
     free_gb = free / (1024**3)
     return free_gb >= required_gb, free_gb
 
 def download_zim_file():
-    """Uses wget to safely download the ZIM file, with pre-flight disk checks."""
+    """Uses wget to safely download the ZIM file at the very end of setup."""
     url = "https://dumps.wikimedia.org/kiwix/zim/wikipedia/wikipedia_en_all_nopic_2026-03.zim"
     filename = "wikipedia_en_all_nopic_2026-03.zim"
-    full_path = os.path.join(DATA_DIR, filename)
-    required_space_gb = 55.0 # 52GB file + 3GB safety buffer
+    required_space_gb = 55.0 
     
     print(f"\n[*] Checking available disk space in current directory...")
     has_space, free_gb = check_disk_space(required_space_gb)
@@ -52,24 +50,22 @@ def download_zim_file():
         print(f"\n[-] CRITICAL WARNING: Insufficient disk space!")
         print(f"    WikiSAG requires ~{required_space_gb}GB of free space, but only {free_gb:.1f}GB is available.")
         print(f"    The automatic download has been ABORTED to protect your operating system.")
-        print(f"\n    CAVEAT: The configuration wizard will still finish so your settings are saved,")
-        print(f"    but WikiSAG will fail to start until you manually free up space and place")
-        print(f"    the correct .zim file in this directory.")
-        return full_path
+        print(f"\n    CAVEAT: Your config is saved, but WikiSAG will fail to start until you")
+        print(f"    manually free up space and place the correct .zim file in this directory.")
+        sys.exit(1)
 
     print(f"[+] Disk space check passed ({free_gb:.1f}GB available).")
     print(f"[*] Preparing to download {filename} (~52GB).")
     print("    This will take a significant amount of time depending on your network speed.")
-    print("    NOTE: If the download fails or you hit Ctrl-C, just run this script again.")
-    print("    It will automatically resume where it left off!\n")
+    print("    NOTE: If the download fails or you hit Ctrl-C, just run 'wikisag' again.")
+    print("    It will automatically resume exactly where it left off!\n")
     
     try:
         subprocess.run(['wget', '-c', url], check=True)
         print("\n[+] Download completed successfully!")
-        return full_path
     except FileNotFoundError:
         print("\n[-] ERROR: 'wget' is not installed on this system.")
-        return ask("Enter the path to your manually downloaded ZIM file", filename)
+        sys.exit(1)
     except subprocess.CalledProcessError:
         print("\n[-] ERROR: Download was interrupted or failed.")
         print("    Please run the script again to resume.")
@@ -91,10 +87,12 @@ def run_interactive_setup():
     
     print("\n--- Wikipedia Database ---")
     print("WikiSAG needs a .zim file to function.")
-    dl_ans = ask("Do you want to automatically download the recommended ~52GB 'nopic' database now? (yes/no)", "yes").lower()
+    dl_ans = ask("Do you want to automatically download the recommended ~52GB 'nopic' database? (yes/no)", "yes").lower()
     
+    needs_download = False
     if dl_ans in ['y', 'yes', 'true']:
-        c_zim = download_zim_file()
+        c_zim = os.path.join(DATA_DIR, "wikipedia_en_all_nopic_2026-03.zim")
+        needs_download = True
     else:
         c_zim = ask("ZIM File Path", "wikipedia_en_all_nopic_2026-03.zim")
         
@@ -108,6 +106,7 @@ def run_interactive_setup():
     svc_ans = ask("Run as system service? (yes/no)", "yes").lower()
     c_svc = 'yes' if svc_ans in ['y', 'yes', 'true'] else 'no'
 
+    # 1. Lock in the configuration FIRST
     config = configparser.ConfigParser()
     config['System'] = {'run_as_service': c_svc}
     config['Network'] = {'host': c_host, 'port': c_port}
@@ -116,7 +115,12 @@ def run_interactive_setup():
     
     with open(CONFIG_FILE, 'w') as configfile:
         config.write(configfile)
-    print(f"\n[+] Configuration saved to {CONFIG_FILE}!\n")
+    print(f"\n[+] Configuration saved to {CONFIG_FILE}!")
+
+    # 2. Run the massive download LAST
+    if needs_download:
+        print("\n--- Starting Wikipedia Database Download ---")
+        download_zim_file()
 
 # --- Configuration Validation ---
 def validate_config():
