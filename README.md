@@ -47,7 +47,7 @@ WikiSAG is designed to be installed as a "Node Appliance" right next to your exi
 Run this single command to download the installer, build the isolated Python environment, and set up the global command:
 
 ```bash
-curl -sSL [https://raw.githubusercontent.com/DGxInfinitY/WikiSAG/master/install.sh](https://raw.githubusercontent.com/DGxInfinitY/WikiSAG/master/install.sh) | bash
+curl -sSL https://raw.githubusercontent.com/DGxInfinitY/WikiSAG/master/install.sh | bash
 ```
 
 *(Note: The installer will ask for your `sudo` password strictly to install core OS dependencies like `python3-venv` and `wget`.)*
@@ -104,7 +104,7 @@ telnet 127.0.0.1 8000
 
 ## 🛠️ Configuration & Management
 
-If you ever need to change your AI model, update the listening port, or toggle the background service, you don't need to hunt down config files. Just run the configuration flag:
+If you ever need to change your AI model, update the listening port, or toggle the background service, you don't need to hunt down config files. Just run wikisag with the configuration flag:
 
 ```bash
 wikisag -c
