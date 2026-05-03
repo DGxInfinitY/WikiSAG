@@ -9,6 +9,9 @@ import configparser
 import subprocess
 import shutil
 import logging
+import urllib.request
+import json
+from urllib.parse import urlparse
 from logging.handlers import RotatingFileHandler
 from libzim.reader import Archive
 from libzim.search import Query, Searcher
@@ -42,9 +45,8 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# --- Service Management (The Timeout Fix) ---
+# --- Service Management ---
 def enforce_service_state(desired_state, start_immediately=True):
-    """Installs or removes the service. Separates installation from starting."""
     if not sys.stdout.isatty():
         return
     is_installed = os.path.exists(SERVICE_PATH)
@@ -130,6 +132,22 @@ def download_zim_file():
         logging.error("\n[-] ERROR: Download was interrupted or failed. Run script again to resume.")
         sys.exit(1)
 
+# --- Ollama API Discovery ---
+def fetch_ollama_models(api_url):
+    """Pings the Ollama REST API to see if it is running and fetches installed models."""
+    try:
+        parsed = urlparse(api_url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        tags_url = f"{base_url}/api/tags"
+        
+        req = urllib.request.Request(tags_url, method="GET")
+        with urllib.request.urlopen(req, timeout=2.0) as response:
+            if response.status == 200:
+                data = json.loads(response.read().decode())
+                return [m['name'] for m in data.get('models', [])]
+    except Exception:
+        return []
+
 # --- Interactive Setup Wizard ---
 def ask(prompt_text, default_val):
     answer = input(f"{prompt_text} [{default_val}]: ").strip()
@@ -155,8 +173,36 @@ def run_interactive_setup():
         c_zim = ask("ZIM File Path", "wikipedia_en_all_nopic_2026-03.zim")
         
     print("\n--- AI Model Configuration ---")
-    c_model = ask("Ollama Model Name", "gemma4:e2b-it-q8_0")
     c_url = ask("Ollama API URL", "http://localhost:11434/v1")
+    
+    # Auto-detect models via the API
+    print("[*] Detecting installed Ollama models...")
+    models = fetch_ollama_models(c_url)
+    
+    if models:
+        print("\nAvailable Models Detected:")
+        for i, m in enumerate(models, 1):
+            print(f"  {i}) {m}")
+        print(f"  0) Enter a custom model name manually")
+        
+        while True:
+            choice = input(f"\nSelect a model (0-{len(models)}) [1]: ").strip()
+            if not choice:
+                c_model = models[0]
+                break
+            elif choice.isdigit():
+                idx = int(choice)
+                if idx == 0:
+                    c_model = ask("Enter custom Ollama Model Name", "gemma4:e2b-it-q8_0")
+                    break
+                elif 1 <= idx <= len(models):
+                    c_model = models[idx-1]
+                    break
+            print("Invalid selection. Please enter a valid number.")
+    else:
+        print("[-] Could not automatically detect models. (Ollama might not be running yet).")
+        c_model = ask("Ollama Model Name", "gemma4:e2b-it-q8_0")
+        
     c_chars = ask("Max Context Characters", "15000")
     
     print("\n--- System Service ---")
@@ -174,24 +220,19 @@ def run_interactive_setup():
         config.write(configfile)
     print(f"\n[+] Configuration saved to {CONFIG_FILE}!")
 
-    # Step 1: Hook the service immediately while the user is still at the keyboard
     enforce_service_state(c_svc == 'yes', start_immediately=False)
 
-    # Step 2: Run the massive download
     if needs_download:
         download_zim_file()
 
-    # Step 3: Attempt to start the background daemon
     if c_svc == 'yes':
         logging.info("\n[*] Starting background service...")
         try:
-            # Stop it first just in case it was already running during a reconfig
             subprocess.run(['sudo', 'systemctl', 'stop', SERVICE_NAME], stderr=subprocess.DEVNULL)
             subprocess.run(['sudo', 'systemctl', 'start', SERVICE_NAME], check=True)
             logging.info("[+] Service started successfully. Node is live! Exiting terminal.")
             sys.exit(0)
         except subprocess.CalledProcessError:
-            # The graceful timeout catcher
             logging.warning("\n[-] Sudo prompt timed out while waiting for the download to finish.")
             logging.info(f"    Your node is fully configured. To start it, run: sudo systemctl start {SERVICE_NAME}")
             sys.exit(0)
@@ -219,7 +260,6 @@ if not validate_config() or force_config:
         logging.error(f"CRITICAL ERROR: Invalid or missing {CONFIG_FILE}.")
         sys.exit(1)
 
-# Load config for execution
 config = configparser.ConfigParser()
 config.read(CONFIG_FILE)
 
@@ -234,7 +274,6 @@ ZIM_FILE_PATH = config.get('Data', 'zim_file', fallback='wikipedia_en_all_nopic_
 if not os.path.isabs(ZIM_FILE_PATH):
     ZIM_FILE_PATH = os.path.join(BASE_DIR, ZIM_FILE_PATH)
 
-# Ensure service state aligns with the INI file if skipped the wizard
 enforce_service_state(RUN_AS_SERVICE, start_immediately=True)
 
 client = OpenAI(base_url=OLLAMA_URL, api_key='ollama')
