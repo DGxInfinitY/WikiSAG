@@ -134,7 +134,6 @@ def download_zim_file():
 
 # --- Ollama API Discovery ---
 def fetch_ollama_models(api_url):
-    """Pings the Ollama REST API to see if it is running and fetches installed models."""
     try:
         parsed = urlparse(api_url)
         base_url = f"{parsed.scheme}://{parsed.netloc}"
@@ -175,10 +174,7 @@ def run_interactive_setup():
     print("\n--- AI Model Configuration ---")
     c_url = ask("Ollama API URL", "http://localhost:11434/v1")
     
-    # Auto-detect models via the API
-    print("[*] Detecting installed Ollama models...")
     models = fetch_ollama_models(c_url)
-    
     if models:
         print("\nAvailable Models Detected:")
         for i, m in enumerate(models, 1):
@@ -209,7 +205,6 @@ def run_interactive_setup():
     svc_ans = ask("Run as background systemd service? (yes/no)", "yes").lower()
     c_svc = 'yes' if svc_ans in ['y', 'yes', 'true'] else 'no'
 
-    # Lock in config
     config = configparser.ConfigParser()
     config['System'] = {'run_as_service': c_svc}
     config['Network'] = {'host': c_host, 'port': c_port}
@@ -233,8 +228,8 @@ def run_interactive_setup():
             logging.info("[+] Service started successfully. Node is live! Exiting terminal.")
             sys.exit(0)
         except subprocess.CalledProcessError:
-            logging.warning("\n[-] Sudo prompt timed out while waiting for the download to finish.")
-            logging.info(f"    Your node is fully configured. To start it, run: sudo systemctl start {SERVICE_NAME}")
+            logging.warning("\n[-] Sudo prompt timed out while waiting for download.")
+            logging.info(f"    Run: sudo systemctl start {SERVICE_NAME}")
             sys.exit(0)
 
 def validate_config():
@@ -251,13 +246,11 @@ def validate_config():
 force_config = False
 if len(sys.argv) > 1 and sys.argv[1] in ['-c', '--config']:
     force_config = True
-    logging.info("\n[*] Configuration flag detected. Launching wizard...")
 
 if not validate_config() or force_config:
     if sys.stdout.isatty():
         run_interactive_setup()
     else:
-        logging.error(f"CRITICAL ERROR: Invalid or missing {CONFIG_FILE}.")
         sys.exit(1)
 
 config = configparser.ConfigParser()
@@ -284,14 +277,13 @@ try:
     searcher = Searcher(zim)
     logging.info("ZIM archive loaded successfully.")
 except Exception as e:
-    logging.error(f"CRITICAL ERROR: Could not load ZIM file. Check {CONFIG_FILE}. Details: {e}")
+    logging.error(f"CRITICAL ERROR: Could not load ZIM file: {e}")
     sys.exit(1)
 
 # --- Core RAG Logic ---
 def search_offline_wikipedia(user_query, top_k=1):
     query = Query().set_query(user_query)
     search_results = searcher.search(query)
-    
     context = ""
     for result in list(search_results.getResults(0, top_k)):
         path = result if isinstance(result, str) else result.path
@@ -300,57 +292,48 @@ def search_offline_wikipedia(user_query, top_k=1):
         markdown_text = markdownify(html_content, strip=['a', 'img', 'script', 'style'])
         clean_text = re.sub(r'\n\s*\n', '\n\n', markdown_text).strip()
         context += f"Title: {entry.title}\n{clean_text}\n\n---\n\n"
-        
     return context if context else "No relevant offline Wikipedia articles found."
 
 def query_ai(user_question):
     context = search_offline_wikipedia(user_question, top_k=1)
-    
     if len(context) > MAX_CHARS:
         context = context[:MAX_CHARS] + "... [Article Truncated]"
-        
-    prompt = f"""You are a helpful offline survival assistant. 
-Use the following Wikipedia article text to answer the user's question. 
-Be concise, direct, and factual. Limit your response to 2 short paragraphs or bullet points.
-If the answer is not in the text, say you don't know based on the provided context.
-
-Context:
-{context}
-
-Question: {user_question}
-"""
-
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
-    )
+    prompt = f"You are a helpful offline assistant. Use the following context to answer briefly: {context}\nQuestion: {user_question}"
+    response = client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": prompt}], temperature=0.1)
     return response.choices[0].message.content
 
 # --- Packet Network Server ---
 def handle_client(conn, addr):
     logging.info(f"[{addr[0]}:{addr[1]}] Connection established.")
     try:
-        conn.sendall(b"*** Offline Wiki Assistant ***\r\nType your question:\r\n> ")
-        data = conn.recv(1024).decode('utf-8').strip()
+        greeting = (
+            "\r\n*** Offline Wiki Assistant ***\r\n"
+            "----------------------------------------------\r\n"
+            "INSTRUCTIONS:\r\n"
+            " - Type a specific question (e.g., 'How to treat a burn?')\r\n"
+            " - Please wait; processing takes 10-30 seconds.\r\n"
+            " - To return to the node, type: EXIT, QUIT, or BYE.\r\n"
+            "----------------------------------------------\r\n"
+            "Type your question:\r\n> "
+        )
+        conn.sendall(greeting.encode('utf-8'))
         
-        if data and not shutdown_event.is_set():
-            logging.info(f"[{addr[0]}:{addr[1]}] User asked: {data}")
+        while not shutdown_event.is_set():
+            raw_data = conn.recv(1024).decode('utf-8').strip()
+            if not raw_data:
+                break
+            if raw_data.lower() in ['exit', 'quit', 'bye', 'disconnect']:
+                conn.sendall(b"73! Returning to node...\r\n")
+                break
+            logging.info(f"[{addr[0]}:{addr[1]}] User asked: {raw_data}")
             conn.sendall(b"Searching index and querying AI... Please wait.\r\n")
-            
-            answer = query_ai(data)
-            
-            if not shutdown_event.is_set():
-                formatted_answer = answer.replace('\n', '\r\n') + "\r\n"
-                conn.sendall(formatted_answer.encode('utf-8'))
-            else:
-                conn.sendall(b"\r\n[Server is shutting down. Transmission aborted.]\r\n")
-                
+            answer = query_ai(raw_data)
+            formatted_answer = "\r\n" + answer.replace('\n', '\r\n') + "\r\n\r\n> "
+            conn.sendall(formatted_answer.encode('utf-8'))
     except Exception as e:
-        logging.error(f"[{addr[0]}:{addr[1]}] Error handling connection: {e}", exc_info=True)
+        logging.error(f"[{addr[0]}:{addr[1]}] Error: {e}")
     finally:
         conn.close()
-        logging.info(f"[{addr[0]}:{addr[1]}] Connection closed.")
 
 def start_packet_server():
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -358,33 +341,14 @@ def start_packet_server():
     server_socket.bind((HOST, PORT))
     server_socket.settimeout(1.0)
     server_socket.listen(5)
-    
     logging.info(f"WikiSAG Server listening on {HOST}:{PORT}...")
-    
     while not shutdown_event.is_set():
         try:
             conn, addr = server_socket.accept()
-            client_thread = threading.Thread(target=handle_client, args=(conn, addr))
-            client_thread.start()
-            active_threads.append(client_thread)
-            active_threads[:] = [t for t in active_threads if t.is_alive()]
-            
+            threading.Thread(target=handle_client, args=(conn, addr)).start()
         except socket.timeout:
             continue
-        except Exception as e:
-            if not shutdown_event.is_set():
-                logging.error(f"Socket error: {e}")
-    
-    logging.info("\n[*] Stop signal received. Closing main server socket...")
     server_socket.close()
-    
-    if active_threads:
-        logging.info(f"[*] Waiting for {len(active_threads)} active query thread(s) to finish...")
-        for t in active_threads:
-            t.join(timeout=5.0)
-            
-    logging.info("[+] Shutdown complete. 73!")
-    sys.exit(0)
 
 if __name__ == "__main__":
     start_packet_server()
