@@ -8,28 +8,95 @@ import re
 import configparser
 import subprocess
 import shutil
+import logging
+from logging.handlers import RotatingFileHandler
 from libzim.reader import Archive
 from libzim.search import Query, Searcher
 from markdownify import markdownify
 from openai import OpenAI
 
 # --- Local Appliance Paths ---
-CONFIG_FILE = 'wikisag.ini'
-DATA_DIR = '.'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(BASE_DIR, 'wikisag.ini')
+LOG_FILE = os.path.join(BASE_DIR, 'wikisag.log')
 SERVICE_NAME = 'wikisag.service'
 SERVICE_PATH = f'/etc/systemd/system/{SERVICE_NAME}'
 
-# Global shutdown flag
+# --- Dedicated File Logger with Rotation ---
+log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=2)
+file_handler.setFormatter(log_formatter)
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setFormatter(log_formatter)
+
+logging.basicConfig(level=logging.INFO, handlers=[file_handler, stream_handler])
+
 shutdown_event = threading.Event()
 active_threads = []
 
 # --- Graceful Shutdown Handler ---
 def signal_handler(sig, frame):
-    print("\n\n[!] Termination signal detected (Ctrl-C). Initiating graceful shutdown...")
+    logging.info("\n[!] Termination signal detected. Initiating graceful shutdown...")
     shutdown_event.set()
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
+
+# --- Service Management (The Timeout Fix) ---
+def enforce_service_state(desired_state, start_immediately=True):
+    """Installs or removes the service. Separates installation from starting."""
+    if not sys.stdout.isatty():
+        return
+    is_installed = os.path.exists(SERVICE_PATH)
+
+    if desired_state and not is_installed:
+        logging.info("[*] Hooking into OS and creating systemd service...")
+        script_path = os.path.abspath(__file__)
+        python_exe = sys.executable 
+        current_user = os.getenv('USER') or os.getenv('SUDO_USER') or 'root'
+        
+        service_content = f"""[Unit]
+Description=WikiSAG Offline Wikipedia AI Bridge
+After=network.target ollama.service
+
+[Service]
+Type=simple
+User={current_user}
+WorkingDirectory={BASE_DIR}
+ExecStart={python_exe} {script_path}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+        try:
+            temp_path = os.path.join(BASE_DIR, 'temp_wikisag.service')
+            with open(temp_path, 'w') as f:
+                f.write(service_content)
+            subprocess.run(['sudo', 'mv', temp_path, SERVICE_PATH], check=True)
+            subprocess.run(['sudo', 'systemctl', 'daemon-reload'], check=True)
+            subprocess.run(['sudo', 'systemctl', 'enable', SERVICE_NAME], check=True)
+            
+            if start_immediately:
+                subprocess.run(['sudo', 'systemctl', 'start', SERVICE_NAME], check=True)
+                logging.info("[+] Service started in background. Exiting terminal.")
+                sys.exit(0)
+            else:
+                logging.info("[+] Service configured. It will start after the download finishes.")
+        except Exception as e:
+            logging.error(f"[-] Failed to install service: {e}")
+
+    elif not desired_state and is_installed:
+        logging.info("[*] Removing systemd service...")
+        try:
+            subprocess.run(['sudo', 'systemctl', 'stop', SERVICE_NAME], stderr=subprocess.DEVNULL)
+            subprocess.run(['sudo', 'systemctl', 'disable', SERVICE_NAME], stderr=subprocess.DEVNULL)
+            subprocess.run(['sudo', 'rm', '-f', SERVICE_PATH], check=True)
+            subprocess.run(['sudo', 'systemctl', 'daemon-reload'], check=True)
+            logging.info("[+] Service removed successfully.")
+        except Exception as e:
+            logging.error(f"[-] Failed to remove service: {e}")
 
 # --- Auto-Download Logic ---
 def check_disk_space(required_gb, path="."):
@@ -38,37 +105,29 @@ def check_disk_space(required_gb, path="."):
     return free_gb >= required_gb, free_gb
 
 def download_zim_file():
-    """Uses wget to safely download the ZIM file at the very end of setup."""
     url = "https://dumps.wikimedia.org/kiwix/zim/wikipedia/wikipedia_en_all_nopic_2026-03.zim"
     filename = "wikipedia_en_all_nopic_2026-03.zim"
     required_space_gb = 55.0 
     
-    print(f"\n[*] Checking available disk space in current directory...")
-    has_space, free_gb = check_disk_space(required_space_gb)
+    logging.info("\n[*] Checking available disk space...")
+    has_space, free_gb = check_disk_space(required_space_gb, BASE_DIR)
     
     if not has_space:
-        print(f"\n[-] CRITICAL WARNING: Insufficient disk space!")
-        print(f"    WikiSAG requires ~{required_space_gb}GB of free space, but only {free_gb:.1f}GB is available.")
-        print(f"    The automatic download has been ABORTED to protect your operating system.")
-        print(f"\n    CAVEAT: Your config is saved, but WikiSAG will fail to start until you")
-        print(f"    manually free up space and place the correct .zim file in this directory.")
+        logging.error(f"[-] CRITICAL WARNING: Insufficient disk space!")
+        logging.error(f"    WikiSAG requires ~{required_space_gb}GB of free space, but only {free_gb:.1f}GB is available.")
         sys.exit(1)
 
-    print(f"[+] Disk space check passed ({free_gb:.1f}GB available).")
-    print(f"[*] Preparing to download {filename} (~52GB).")
-    print("    This will take a significant amount of time depending on your network speed.")
-    print("    NOTE: If the download fails or you hit Ctrl-C, just run 'wikisag' again.")
-    print("    It will automatically resume exactly where it left off!\n")
+    logging.info(f"[+] Disk space check passed ({free_gb:.1f}GB available).")
+    logging.info(f"[*] Preparing to download {filename} (~52GB).")
     
     try:
-        subprocess.run(['wget', '-c', url], check=True)
-        print("\n[+] Download completed successfully!")
+        subprocess.run(['wget', '-c', url], check=True, cwd=BASE_DIR)
+        logging.info("\n[+] Download completed successfully!")
     except FileNotFoundError:
-        print("\n[-] ERROR: 'wget' is not installed on this system.")
+        logging.error("\n[-] ERROR: 'wget' is not installed on this system.")
         sys.exit(1)
     except subprocess.CalledProcessError:
-        print("\n[-] ERROR: Download was interrupted or failed.")
-        print("    Please run the script again to resume.")
+        logging.error("\n[-] ERROR: Download was interrupted or failed. Run script again to resume.")
         sys.exit(1)
 
 # --- Interactive Setup Wizard ---
@@ -78,7 +137,7 @@ def ask(prompt_text, default_val):
 
 def run_interactive_setup():
     print("\n" + "="*50)
-    print(" Welcome to WikiSAG First-Run Setup")
+    print(" WikiSAG Configuration Wizard")
     print("="*50 + "\n")
     print("Press Enter to accept the [default] values.\n")
     
@@ -86,12 +145,11 @@ def run_interactive_setup():
     c_port = ask("Listen Port", "8000")
     
     print("\n--- Wikipedia Database ---")
-    print("WikiSAG needs a .zim file to function.")
-    dl_ans = ask("Do you want to automatically download the recommended ~52GB 'nopic' database? (yes/no)", "yes").lower()
+    dl_ans = ask("Automatically download the recommended ~52GB 'nopic' database? (yes/no)", "yes").lower()
     
     needs_download = False
     if dl_ans in ['y', 'yes', 'true']:
-        c_zim = os.path.join(DATA_DIR, "wikipedia_en_all_nopic_2026-03.zim")
+        c_zim = os.path.join(BASE_DIR, "wikipedia_en_all_nopic_2026-03.zim")
         needs_download = True
     else:
         c_zim = ask("ZIM File Path", "wikipedia_en_all_nopic_2026-03.zim")
@@ -102,11 +160,10 @@ def run_interactive_setup():
     c_chars = ask("Max Context Characters", "15000")
     
     print("\n--- System Service ---")
-    print("Do you want WikiSAG to run silently in the background as a systemd service?")
-    svc_ans = ask("Run as system service? (yes/no)", "yes").lower()
+    svc_ans = ask("Run as background systemd service? (yes/no)", "yes").lower()
     c_svc = 'yes' if svc_ans in ['y', 'yes', 'true'] else 'no'
 
-    # 1. Lock in the configuration FIRST
+    # Lock in config
     config = configparser.ConfigParser()
     config['System'] = {'run_as_service': c_svc}
     config['Network'] = {'host': c_host, 'port': c_port}
@@ -117,88 +174,52 @@ def run_interactive_setup():
         config.write(configfile)
     print(f"\n[+] Configuration saved to {CONFIG_FILE}!")
 
-    # 2. Run the massive download LAST
+    # Step 1: Hook the service immediately while the user is still at the keyboard
+    enforce_service_state(c_svc == 'yes', start_immediately=False)
+
+    # Step 2: Run the massive download
     if needs_download:
-        print("\n--- Starting Wikipedia Database Download ---")
         download_zim_file()
 
-# --- Configuration Validation ---
+    # Step 3: Attempt to start the background daemon
+    if c_svc == 'yes':
+        logging.info("\n[*] Starting background service...")
+        try:
+            # Stop it first just in case it was already running during a reconfig
+            subprocess.run(['sudo', 'systemctl', 'stop', SERVICE_NAME], stderr=subprocess.DEVNULL)
+            subprocess.run(['sudo', 'systemctl', 'start', SERVICE_NAME], check=True)
+            logging.info("[+] Service started successfully. Node is live! Exiting terminal.")
+            sys.exit(0)
+        except subprocess.CalledProcessError:
+            # The graceful timeout catcher
+            logging.warning("\n[-] Sudo prompt timed out while waiting for the download to finish.")
+            logging.info(f"    Your node is fully configured. To start it, run: sudo systemctl start {SERVICE_NAME}")
+            sys.exit(0)
+
 def validate_config():
     if not os.path.exists(CONFIG_FILE):
         return False
     config = configparser.ConfigParser()
     try:
         config.read(CONFIG_FILE)
-        required_sections = ['System', 'Network', 'Ollama', 'Data']
-        for section in required_sections:
-            if section not in config:
-                return False
-        return True
+        return all(s in config for s in ['System', 'Network', 'Ollama', 'Data'])
     except configparser.Error:
         return False
 
-# --- Service Management (Desired State Sync) ---
-def sync_service_state(desired_state):
-    if not sys.stdout.isatty():
-        return
+# --- Boot Logic & Flag Handling ---
+force_config = False
+if len(sys.argv) > 1 and sys.argv[1] in ['-c', '--config']:
+    force_config = True
+    logging.info("\n[*] Configuration flag detected. Launching wizard...")
 
-    is_installed = os.path.exists(SERVICE_PATH)
-
-    if desired_state and not is_installed:
-        print("\n[*] Installing systemd service...")
-        script_path = os.path.abspath(__file__)
-        working_dir = os.path.dirname(script_path)
-        python_exe = sys.executable 
-        current_user = os.getenv('USER') or os.getenv('SUDO_USER') or 'root'
-
-        service_content = f"""[Unit]
-Description=WikiSAG Offline Wikipedia AI Bridge
-After=network.target ollama.service
-
-[Service]
-Type=simple
-User={current_user}
-WorkingDirectory={working_dir}
-ExecStart={python_exe} {script_path}
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-"""
-        try:
-            temp_path = os.path.join(working_dir, 'temp_wikisag.service')
-            with open(temp_path, 'w') as f:
-                f.write(service_content)
-            
-            subprocess.run(['sudo', 'mv', temp_path, SERVICE_PATH], check=True)
-            subprocess.run(['sudo', 'systemctl', 'daemon-reload'], check=True)
-            subprocess.run(['sudo', 'systemctl', 'enable', SERVICE_NAME], check=True)
-            subprocess.run(['sudo', 'systemctl', 'start', SERVICE_NAME], check=True)
-            print("[+] Service installed. Running in background. Exiting terminal.")
-            sys.exit(0)
-        except Exception as e:
-            print(f"[-] Failed to install service: {e}")
-
-    elif not desired_state and is_installed:
-        print("\n[*] Removing systemd service...")
-        try:
-            subprocess.run(['sudo', 'systemctl', 'stop', SERVICE_NAME], check=True)
-            subprocess.run(['sudo', 'systemctl', 'disable', SERVICE_NAME], check=True)
-            subprocess.run(['sudo', 'rm', SERVICE_PATH], check=True)
-            subprocess.run(['sudo', 'systemctl', 'daemon-reload'], check=True)
-            print("[+] Service removed successfully.")
-        except Exception as e:
-            print(f"[-] Failed to remove service: {e}")
-
-# --- Boot Logic ---
-if not validate_config():
+if not validate_config() or force_config:
     if sys.stdout.isatty():
         run_interactive_setup()
     else:
-        print(f"CRITICAL ERROR: Invalid or missing {CONFIG_FILE}.")
+        logging.error(f"CRITICAL ERROR: Invalid or missing {CONFIG_FILE}.")
         sys.exit(1)
 
+# Load config for execution
 config = configparser.ConfigParser()
 config.read(CONFIG_FILE)
 
@@ -210,18 +231,21 @@ MODEL = config.get('Ollama', 'model', fallback='gemma4:e2b-it-q8_0')
 MAX_CHARS = config.getint('Ollama', 'max_context_chars', fallback=15000)
 ZIM_FILE_PATH = config.get('Data', 'zim_file', fallback='wikipedia_en_all_nopic_2026-03.zim')
 
-sync_service_state(RUN_AS_SERVICE)
+if not os.path.isabs(ZIM_FILE_PATH):
+    ZIM_FILE_PATH = os.path.join(BASE_DIR, ZIM_FILE_PATH)
 
-# --- Initialize Global Clients ---
+# Ensure service state aligns with the INI file if skipped the wizard
+enforce_service_state(RUN_AS_SERVICE, start_immediately=True)
+
 client = OpenAI(base_url=OLLAMA_URL, api_key='ollama')
 
 try:
-    print(f"Loading ZIM archive: {ZIM_FILE_PATH}...")
+    logging.info(f"Loading ZIM archive: {ZIM_FILE_PATH}...")
     zim = Archive(ZIM_FILE_PATH)
     searcher = Searcher(zim)
-    print("ZIM archive loaded successfully.")
+    logging.info("ZIM archive loaded successfully.")
 except Exception as e:
-    print(f"CRITICAL ERROR: Could not load ZIM file. Check {CONFIG_FILE}. Details: {e}")
+    logging.error(f"CRITICAL ERROR: Could not load ZIM file. Check {CONFIG_FILE}. Details: {e}")
     sys.exit(1)
 
 # --- Core RAG Logic ---
@@ -231,7 +255,8 @@ def search_offline_wikipedia(user_query, top_k=1):
     
     context = ""
     for result in list(search_results.getResults(0, top_k)):
-        entry = zim.get_entry_by_path(result.path)
+        path = result if isinstance(result, str) else result.path
+        entry = zim.get_entry_by_path(path)
         html_content = bytes(entry.get_item().content).decode("UTF-8")
         markdown_text = markdownify(html_content, strip=['a', 'img', 'script', 'style'])
         clean_text = re.sub(r'\n\s*\n', '\n\n', markdown_text).strip()
@@ -265,13 +290,13 @@ Question: {user_question}
 
 # --- Packet Network Server ---
 def handle_client(conn, addr):
-    print(f"[{addr}] Connection established.")
+    logging.info(f"[{addr[0]}:{addr[1]}] Connection established.")
     try:
-        conn.sendall(b"*** WikiSAG Offline Assistant ***\r\nType your question:\r\n> ")
+        conn.sendall(b"*** Offline Wiki Assistant ***\r\nType your question:\r\n> ")
         data = conn.recv(1024).decode('utf-8').strip()
         
         if data and not shutdown_event.is_set():
-            print(f"[{addr}] User asked: {data}")
+            logging.info(f"[{addr[0]}:{addr[1]}] User asked: {data}")
             conn.sendall(b"Searching index and querying AI... Please wait.\r\n")
             
             answer = query_ai(data)
@@ -283,20 +308,19 @@ def handle_client(conn, addr):
                 conn.sendall(b"\r\n[Server is shutting down. Transmission aborted.]\r\n")
                 
     except Exception as e:
-        print(f"[{addr}] Error handling connection: {e}")
+        logging.error(f"[{addr[0]}:{addr[1]}] Error handling connection: {e}", exc_info=True)
     finally:
         conn.close()
-        print(f"[{addr}] Connection closed.")
+        logging.info(f"[{addr[0]}:{addr[1]}] Connection closed.")
 
 def start_packet_server():
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) 
     server_socket.bind((HOST, PORT))
-    
     server_socket.settimeout(1.0)
     server_socket.listen(5)
     
-    print(f"WikiSAG Server listening on {HOST}:{PORT}...")
+    logging.info(f"WikiSAG Server listening on {HOST}:{PORT}...")
     
     while not shutdown_event.is_set():
         try:
@@ -304,25 +328,23 @@ def start_packet_server():
             client_thread = threading.Thread(target=handle_client, args=(conn, addr))
             client_thread.start()
             active_threads.append(client_thread)
-            
             active_threads[:] = [t for t in active_threads if t.is_alive()]
             
         except socket.timeout:
             continue
         except Exception as e:
             if not shutdown_event.is_set():
-                print(f"Socket error: {e}")
+                logging.error(f"Socket error: {e}")
     
-    # --- Shutdown Sequence ---
-    print("\n[*] Stop signal received. Closing main server socket...")
+    logging.info("\n[*] Stop signal received. Closing main server socket...")
     server_socket.close()
     
     if active_threads:
-        print(f"[*] Waiting for {len(active_threads)} active query thread(s) to finish dropping connections...")
+        logging.info(f"[*] Waiting for {len(active_threads)} active query thread(s) to finish...")
         for t in active_threads:
             t.join(timeout=5.0)
             
-    print("[+] Shutdown complete. 73!")
+    logging.info("[+] Shutdown complete. 73!")
     sys.exit(0)
 
 if __name__ == "__main__":
