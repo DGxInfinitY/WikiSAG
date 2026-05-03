@@ -48,3 +48,86 @@ Run this single command to download the installer, build the isolated Python env
 
 ```bash
 curl -sSL [https://raw.githubusercontent.com/DGxInfinitY/WikiSAG/master/install.sh](https://raw.githubusercontent.com/DGxInfinitY/WikiSAG/master/install.sh) | bash
+```
+
+*(Note: The installer will ask for your `sudo` password strictly to install core OS dependencies like `python3-venv` and `wget`.)*
+
+### First-Run Setup
+Once installed, run the interactive setup wizard from anywhere in your terminal:
+
+```bash
+wikisag
+```
+
+The wizard will:
+1. Allow you to customize your network ports and Ollama connection.
+2. Hook into the OS to create a background `systemd` service.
+3. Automatically download the massive ~52GB Wikipedia database directly from Kiwix (with resume support).
+4. Seamlessly start the background daemon once the download finishes.
+
+---
+
+## 📂 Directory Structure
+
+WikiSAG adheres to a localized structure to make node backups painless. By default, everything lives in:
+
+```text
+~/wikisag/
+├── wikisag.py                  # Core application logic
+├── wikisag.ini                 # User configurations (auto-generated)
+├── wikisag.log                 # Rolling log file (capped at 5MB)
+├── wikipedia_en_nopic.zim      # The 52GB offline database
+├── venv/                       # Isolated Python environment
+```
+
+The installer also places a wrapper script in `~/.local/bin/wikisag` so you can launch the program globally.
+
+---
+
+## 📻 Integrating with linBPQ
+
+To make WikiSAG available to your RF users, add an `APPLICATION` block to your `bpq32.cfg` file. 
+
+Map the application directly to the TCP port you defined during the WikiSAG setup (default is `8000`). Replace `C 1` with whichever BPQ port number your Telnet driver is running on:
+
+```ini
+; TELNET tells BPQ to bridge the raw TCP socket without AX.25 formatting
+APPLICATION 1,WIKI,C 1 TELNET 127.0.0.1 8000 S
+```
+
+Alternatively, you can test the system locally without a radio by simply telnetting into the port:
+```bash
+telnet 127.0.0.1 8000
+```
+
+---
+
+## 🛠️ Configuration & Management
+
+If you ever need to change your AI model, update the listening port, or toggle the background service, you don't need to hunt down config files. Just run the configuration flag:
+
+```bash
+wikisag -c
+```
+This will instantly launch the setup wizard, allow you to update your parameters, automatically adjust your `systemd` hooks, and restart the node.
+
+### Advanced/Manual Configuration
+If you prefer to edit configurations manually, you can modify the `wikisag.ini` file located in your installation directory:
+
+```ini
+[Network]
+host = 127.0.0.1
+port = 8000
+
+[Ollama]
+base_url = http://localhost:11434/v1
+model = gemma4:e2b-it-q8_0
+max_context_chars = 15000
+
+[Data]
+zim_file = /home/username/wikisag/wikipedia_en_all_nopic_2026-03.zim
+
+[System]
+run_as_service = yes
+```
+*(If you modify `run_as_service` manually, simply run `wikisag` once in the terminal to allow the script to automatically install or remove the OS background service based on your changes).*
