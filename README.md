@@ -2,7 +2,7 @@
 
 **Search-Augmented Generation Bridge for Offline Wikipedia & Packet Radio**
 
-WikiSAG is a lightweight, fully offline Artificial Intelligence bridge designed for SHTF (Shit Hits The Fan) scenarios and amateur radio networks. It allows node operators to provide users with an interactive, AI-powered Wikipedia assistant over low-bandwidth RF links (like 1200 baud VHF or HF packet radio) using tools like **linBPQ**.
+WikiSAG is a lightweight, fully offline Artificial Intelligence bridge designed for SHTF scenarios and amateur radio networks. It allows node operators to provide users with an interactive, AI-powered Wikipedia assistant over low-bandwidth RF links (like 1200 baud VHF or HF packet radio) using tools like **linBPQ**.
 
 By utilizing a highly compressed `.zim` archive and a local LLM via Ollama, WikiSAG acts as a local TCP socket server, accepting questions, retrieving relevant encyclopedia articles, and summarizing the answers concisely for transmission over the airwaves—all with zero internet connection.
 
