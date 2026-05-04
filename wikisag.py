@@ -37,6 +37,31 @@ logging.basicConfig(level=logging.INFO, handlers=[file_handler, stream_handler])
 shutdown_event = threading.Event()
 active_threads = []
 
+# --- Global Default Prompts (Formatted for INI multi-line support) ---
+DEFAULT_ROUTER_PROMPT = (
+    "You are a keyword extractor.\n"
+    " Convert the user's question into 1 or 2 highly specific Wikipedia search terms.\n"
+    " DO NOT answer the question. No punctuation.\n"
+    " Example 1:\n"
+    " User: How to treat a burn?\n"
+    " Output: Burn injury first aid\n"
+    " Example 2:\n"
+    " User: When do I plant corn?\n"
+    " Output: Corn planting season"
+)
+
+DEFAULT_PRIMARY_PROMPT = (
+    "You are a specialized Knowledge Retrieval Assistant operating over a low-bandwidth Emergency Packet Radio link.\n"
+    " GOAL: Provide the exact, correct answer immediately, resembling a highly accurate search engine \"Featured Snippet\".\n"
+    " CONSTRAINTS:\n"
+    " - Evaluate the provided Wikipedia Context. If it contains the answer, use it.\n"
+    " - If the Context is irrelevant to the question, IGNORE IT entirely and use your internal knowledge.\n"
+    " - CRITICAL GAG ORDER: DO NOT mention the provided context. NEVER say \"According to the text...\" or \"The provided text does not contain...\".\n"
+    " - BLUF (Bottom Line Up Front): Start your response IMMEDIATELY with the most direct, factual answer.\n"
+    " - No apologies, no conversational filler, no greetings.\n"
+    " - Be EXTREMELY concise. Use short bullet points for steps or data."
+)
+
 # --- Graceful Shutdown Handler ---
 def signal_handler(sig, frame):
     logging.info("\n[!] Termination signal detected. Initiating graceful shutdown...")
@@ -201,33 +226,13 @@ def run_interactive_setup():
     models = fetch_ollama_models(c_url)
     
     c_primary_model = select_model_from_list(models, "Primary Model (The Heavy Lifter)", "gemma4:e2b-it-q8_0")
-    c_router_model = select_model_from_list(models, "Router Model (The Speedy Extractor)", "llama3.2:1b")
+    c_router_model = select_model_from_list(models, "Router Model (The Speedy Extractor)", "qwen2.5:1.5b")
         
     c_chars = ask("Max Context Characters", "15000")
     
     print("\n--- System Service ---")
     svc_ans = ask("Run as background systemd service? (yes/no)", "yes").lower()
     c_svc = 'yes' if svc_ans in ['y', 'yes', 'true'] else 'no'
-
-    # Default Prompts (Formatted with leading spaces for INI multi-line support)
-    default_router_prompt = (
-        "You are a search query generator.\n"
-        " Convert the user's question into 1 or 2 highly specific Wikipedia search terms.\n"
-        " If it is a medical question, add \"(injury)\" or \"medical\" to the term.\n"
-        " DO NOT answer the question. ONLY output the search terms. No punctuation."
-    )
-    
-    default_primary_prompt = (
-        "You are a specialized Knowledge Retrieval Assistant operating over a low-bandwidth Emergency Packet Radio link.\n"
-        " GOAL: Provide the exact, correct answer immediately, resembling a highly accurate search engine \"Featured Snippet\".\n"
-        " CONSTRAINTS:\n"
-        " - Evaluate the provided Wikipedia Context. If it contains the answer, use it.\n"
-        " - If the Context is irrelevant to the question, IGNORE IT entirely and use your internal knowledge.\n"
-        " - CRITICAL GAG ORDER: DO NOT mention the provided context. NEVER say \"According to the text...\" or \"The provided text does not contain...\".\n"
-        " - BLUF (Bottom Line Up Front): Start your response IMMEDIATELY with the most direct, factual answer.\n"
-        " - No apologies, no conversational filler, no greetings.\n"
-        " - Be EXTREMELY concise. Use short bullet points for steps or data."
-    )
 
     config = configparser.ConfigParser()
     config['System'] = {'run_as_service': c_svc}
@@ -240,8 +245,8 @@ def run_interactive_setup():
         'max_context_chars': c_chars
     }
     config['Prompts'] = {
-        'router_system_prompt': default_router_prompt,
-        'primary_system_prompt': default_primary_prompt
+        'router_system_prompt': DEFAULT_ROUTER_PROMPT,
+        'primary_system_prompt': DEFAULT_PRIMARY_PROMPT
     }
     
     with open(CONFIG_FILE, 'w') as configfile:
@@ -304,11 +309,11 @@ if not os.path.isabs(ZIM_FILE_PATH):
 
 OLLAMA_URL = config.get('Ollama', 'base_url', fallback='http://localhost:11434/v1')
 PRIMARY_MODEL = config.get('Ollama', 'primary_model', fallback='gemma4:e2b-it-q8_0')
-ROUTER_MODEL = config.get('Ollama', 'router_model', fallback='llama3.2:1b')
+ROUTER_MODEL = config.get('Ollama', 'router_model', fallback='qwen2.5:1.5b')
 MAX_CHARS = config.getint('Ollama', 'max_context_chars', fallback=15000)
 
-ROUTER_PROMPT = config.get('Prompts', 'router_system_prompt', fallback="")
-PRIMARY_PROMPT = config.get('Prompts', 'primary_system_prompt', fallback="")
+ROUTER_PROMPT = config.get('Prompts', 'router_system_prompt', fallback=DEFAULT_ROUTER_PROMPT)
+PRIMARY_PROMPT = config.get('Prompts', 'primary_system_prompt', fallback=DEFAULT_PRIMARY_PROMPT)
 
 enforce_service_state(RUN_AS_SERVICE, start_immediately=True)
 client = OpenAI(base_url=OLLAMA_URL, api_key='ollama')
