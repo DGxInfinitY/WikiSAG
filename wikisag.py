@@ -51,15 +51,15 @@ DEFAULT_ROUTER_PROMPT = (
 )
 
 DEFAULT_PRIMARY_PROMPT = (
-    "You are a specialized Knowledge Retrieval Assistant operating over a low-bandwidth Emergency Packet Radio link.\n"
+    "You are a specialized SHTF Survival Assistant operating over a low-bandwidth Emergency Packet Radio link.\n"
     " GOAL: Provide the exact, correct answer immediately, resembling a highly accurate search engine \"Featured Snippet\".\n"
     " CONSTRAINTS:\n"
-    " - Evaluate the provided Wikipedia Context. If it contains the answer, use it.\n"
-    " - If the Context is irrelevant to the question, IGNORE IT entirely and use your internal knowledge.\n"
-    " - CRITICAL GAG ORDER: DO NOT mention the provided context. NEVER say \"According to the text...\" or \"The provided text does not contain...\".\n"
-    " - BLUF (Bottom Line Up Front): Start your response IMMEDIATELY with the most direct, factual answer.\n"
-    " - No apologies, no conversational filler, no greetings.\n"
-    " - Be EXTREMELY concise. Use short bullet points for steps or data."
+    " - SYNTHESIZE AND ENHANCE: Read the provided Wikipedia Context. Use it for factual grounding, BUT you MUST freely combine it with your own expert internal knowledge. If the text is incomplete or vague, fill in the gaps using your own training to provide a comprehensive, highly specific answer.\n"
+    " - If the Context is completely irrelevant, ignore it completely.\n"
+    " - CRITICAL GAG ORDER: DO NOT mention the provided context. NEVER say \"According to the text...\", \"Based on the provided information...\", or \"The text indicates...\".\n"
+    " - ACTIONABLE: If the user asks \"How to...\", provide specific, actionable, step-by-step instructions.\n"
+    " - BLUF (Bottom Line Up Front): Start IMMEDIATELY with the answer. No apologies, no conversational filler.\n"
+    " - Be EXTREMELY concise. Use short bullet points."
 )
 
 # --- Graceful Shutdown Handler ---
@@ -340,7 +340,6 @@ def generate_ai_search_terms(user_question):
         )
         keywords = response.choices[0].message.content.strip()
         
-        # FIX: If the micro-model hallucinates an empty string, fallback to the raw query
         if not keywords:
             logging.warning(f"[*] Micro-Model choked. Falling back to raw query: '{user_question}'")
             return user_question
@@ -351,8 +350,36 @@ def generate_ai_search_terms(user_question):
         logging.error(f"AI Keyword Error: {e}")
         return user_question
 
-def search_offline_wikipedia(ai_keywords, top_k):
-    """Searches the ZIM database using dynamic top_k depth."""
+def grade_article_relevance(user_question, article_title, article_text):
+    """Uses the Micro-Model as a bouncer to quickly judge if an article is garbage."""
+    snippet = article_text[:1000]
+    prompt = f"""You are a strict relevance judge. 
+Does the following Wikipedia article snippet contain information that helps answer the user's question?
+Answer ONLY with the word "YES" or "NO". Do not explain.
+
+User Question: {user_question}
+Article Title: {article_title}
+Snippet: {snippet}"""
+
+    try:
+        response = client.chat.completions.create(
+            model=ROUTER_MODEL, 
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0, 
+            max_tokens=2 
+        )
+        judgment = response.choices[0].message.content.strip().upper()
+        
+        if "YES" in judgment:
+            return True
+        else:
+            return False
+    except Exception as e:
+        logging.warning(f"[*] Relevance Judge skipped due to error: {e}")
+        return True
+
+def search_offline_wikipedia(ai_keywords, user_question, top_k):
+    """Searches the ZIM database and passes results through the AI Bouncer."""
     query = Query().set_query(ai_keywords)
     search_results = searcher.search(query)
     
@@ -364,27 +391,45 @@ def search_offline_wikipedia(ai_keywords, top_k):
             html_content = bytes(entry.get_item().content).decode("UTF-8")
             markdown_text = markdownify(html_content, strip=['a', 'img', 'script', 'style'])
             clean_text = re.sub(r'\n\s*\n', '\n\n', markdown_text).strip()
-            context_parts.append(f"ARTICLE TITLE: {entry.title}\n{clean_text}")
+            
+            logging.info(f"[*] Judging relevance of article: '{entry.title}'...")
+            is_relevant = grade_article_relevance(user_question, entry.title, clean_text)
+            
+            if is_relevant:
+                logging.info(f"[+] Article '{entry.title}' ACCEPTED.")
+                context_parts.append(f"ARTICLE TITLE: {entry.title}\n{clean_text}")
+            else:
+                logging.info(f"[-] Article '{entry.title}' REJECTED (Irrelevant).")
+                
         except Exception:
             continue
             
-    return "\n\n---\n\n".join(context_parts) if context_parts else "No relevant articles found."
+    return "\n\n---\n\n".join(context_parts) if context_parts else ""
 
 def query_ai(user_question):
+    # Step 1: Micro-Model Generation
     optimized_keywords = generate_ai_search_terms(user_question)
-    context = search_offline_wikipedia(optimized_keywords, top_k=TOP_K)
     
-    if len(context) > MAX_CHARS:
+    # Step 2: Database Search & AI Filtering
+    logging.info(f"[*] Searching ZIM archive for: '{optimized_keywords}'")
+    context = search_offline_wikipedia(optimized_keywords, user_question, top_k=TOP_K)
+    
+    if not context:
+        logging.info("[*] All retrieved articles were rejected. Forcing Primary Model to use internal memory.")
+    elif len(context) > MAX_CHARS:
         context = context[:MAX_CHARS] + "... [Context Truncated]"
         
     prompt = f"{PRIMARY_PROMPT}\n\nCONTEXT FROM OFFLINE WIKIPEDIA:\n{context}\n\nUSER QUESTION: {user_question}"
     
+    # Step 3: Primary Model Handoff
+    logging.info(f"[*] Compiling data and querying Primary Model ({PRIMARY_MODEL})...")
     try:
         response = client.chat.completions.create(
             model=PRIMARY_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
         )
+        logging.info("[+] Primary Model successfully generated an answer.")
         return response.choices[0].message.content
     except Exception as e:
         logging.error(f"AI Query Error: {e}")
@@ -409,17 +454,13 @@ def handle_client(conn, addr):
         conn.sendall(greeting.encode('utf-8'))
         
         while not shutdown_event.is_set():
-            # Read the raw bytes first
             raw_bytes = conn.recv(1024)
             
-            # If we receive 0 bytes, the TCP connection physically dropped
             if not raw_bytes:
                 break
                 
-            # Decode and strip
             raw_data = raw_bytes.decode('utf-8').strip()
             
-            # FIX: If it's just an empty string (User hit Enter), prompt them again!
             if not raw_data:
                 conn.sendall(b"> ")
                 continue
