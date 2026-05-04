@@ -39,15 +39,18 @@ active_threads = []
 
 # --- Global Default Prompts (Formatted for INI multi-line support) ---
 DEFAULT_ROUTER_PROMPT = (
-    "You are a keyword extractor.\n"
-    " Convert the user's question into 1 or 2 highly specific Wikipedia search terms.\n"
-    " DO NOT answer the question. No punctuation.\n"
+    "You are a Wikipedia Title Extractor.\n"
+    " Convert the user's question into 1 or 2 BROAD NOUNS that would match the exact title of a Wikipedia article.\n"
+    " DO NOT use verbs, questions, or highly specific long phrases. Think of the broad encyclopedia category.\n"
     " Example 1:\n"
-    " User: How to treat a burn?\n"
-    " Output: Burn injury first aid\n"
+    " User: What torque specs are needed for a jeep wrangler jl's wheels?\n"
+    " Output: Jeep Wrangler (JL)\n"
     " Example 2:\n"
-    " User: When do I plant corn?\n"
-    " Output: Corn planting season"
+    " User: When do you typically plant corn in Utah?\n"
+    " Output: Agriculture in Utah, Maize\n"
+    " Example 3:\n"
+    " User: How to treat a burn?\n"
+    " Output: Burn, First aid"
 )
 
 DEFAULT_PRIMARY_PROMPT = (
@@ -350,9 +353,12 @@ def generate_ai_search_terms(user_question):
         return user_question
 
 def grade_article_relevance(user_question, article_title, article_text):
-    snippet = article_text[:1000]
-    prompt = f"""You are a relevance judge. 
-Does the following Wikipedia snippet contain ANY information, definitions, or context that is related to the user's question?
+    snippet = article_text[:8000]
+    
+    prompt = f"""You are a forgiving relevance judge. 
+Look at the Article Title and the Snippet. Does this article cover the CORE SUBJECT of the user's question?
+For example, if the user asks about "Jeep JL torque specs", an article titled "Jeep Wrangler (JL)" is a PERFECT match, even if torque isn't mentioned in the snippet.
+We just need the broad background article so the primary AI can read it later. 
 Answer ONLY with the word "YES" or "NO". Do not explain.
 
 User Question: {user_question}
@@ -463,21 +469,30 @@ def handle_client(conn, addr):
                 conn.sendall(b"> ")
                 continue
             
-            if raw_data.lower() in ['exit', 'quit', 'bye', 'disconnect']:
-                conn.sendall(b"73! Returning to node...\r\n")
+            if raw_data.lower() in ['exit', 'quit', 'bye', 'disconnect'] or raw_data.startswith('***'):
+                logging.info(f"[{addr[0]}:{addr[1]}] User or node initiated disconnect.")
+                try:
+                    conn.sendall(b"73! Returning to node...\r\n")
+                except OSError:
+                    pass 
                 break
                 
             logging.info(f"[{addr[0]}:{addr[1]}] User asked: {raw_data}")
-            conn.sendall(b"Searching index and querying AI... Please wait.\r\n")
+            
+            try:
+                conn.sendall(b"Searching index and querying AI... Please wait.\r\n")
+            except OSError:
+                logging.info(f"[{addr[0]}:{addr[1]}] Client dropped off the air. Aborting query.")
+                break
             
             # --- Heartbeat Keepalive Thread ---
             ai_done = threading.Event()
             def send_keepalive():
-                while not ai_done.wait(10.0): # Send a dot every 10 seconds
+                while not ai_done.wait(3.0):
                     try:
                         conn.sendall(b".")
                     except Exception:
-                        break # Socket probably closed, kill thread quietly
+                        break
 
             keepalive_thread = threading.Thread(target=send_keepalive)
             keepalive_thread.start()
@@ -485,15 +500,21 @@ def handle_client(conn, addr):
             try:
                 answer = query_ai(raw_data)
             finally:
-                ai_done.set() # Stop the heartbeat
-                keepalive_thread.join() # Wait for thread to exit cleanly
+                ai_done.set()
+                keepalive_thread.join()
             
             if not shutdown_event.is_set():
-                # Added \r\n at the front to drop down a line after the keepalive dots
                 formatted_answer = "\r\n\r\n" + answer.replace('\n', '\r\n') + "\r\n\r\n> "
-                conn.sendall(formatted_answer.encode('utf-8'))
+                try:
+                    conn.sendall(formatted_answer.encode('utf-8'))
+                except OSError as e:
+                    logging.info(f"[{addr[0]}:{addr[1]}] Socket closed before answer could be sent ({e}).")
+                    break
             else:
-                conn.sendall(b"\r\n[Server is shutting down. Transmission aborted.]\r\n")
+                try:
+                    conn.sendall(b"\r\n[Server is shutting down. Transmission aborted.]\r\n")
+                except OSError:
+                    pass
                 break
                 
     except ConnectionResetError:
@@ -542,4 +563,3 @@ def start_packet_server():
 
 if __name__ == "__main__":
     start_packet_server()
-
