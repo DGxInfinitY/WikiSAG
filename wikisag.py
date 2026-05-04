@@ -362,7 +362,7 @@ def grade_article_relevance(user_question, ai_keywords, article_title, article_t
         return True
 
     # Reduced from 8000 back to 3000 to prevent the micro-model from hanging on huge context
-    snippet = article_text[:3000] 
+    snippet = article_text[:4000] 
     
     prompt = f"""You are a forgiving relevance judge. 
 Look at the Article Title and the Snippet. Does this article cover the CORE SUBJECT of the user's question?
