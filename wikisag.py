@@ -303,7 +303,7 @@ HOST = config.get('Network', 'host', fallback='127.0.0.1')
 PORT = config.getint('Network', 'port', fallback=8000)
 
 ZIM_FILE_PATH = config.get('Data', 'zim_file', fallback='wikipedia_en_all_nopic_2026-03.zim')
-TOP_K = config.getint('Data', 'top_k', fallback=8) # Increased default digging depth
+TOP_K = config.getint('Data', 'top_k', fallback=8)
 if not os.path.isabs(ZIM_FILE_PATH):
     ZIM_FILE_PATH = os.path.join(BASE_DIR, ZIM_FILE_PATH)
 
@@ -329,7 +329,6 @@ except Exception as e:
 
 # --- Agentic RAG Logic ---
 def generate_ai_search_terms(user_question):
-    """Uses the Micro-Model to translate a human question into keywords."""
     prompt = f"{ROUTER_PROMPT}\n\nQuestion: {user_question}"
     try:
         response = client.chat.completions.create(
@@ -351,10 +350,7 @@ def generate_ai_search_terms(user_question):
         return user_question
 
 def grade_article_relevance(user_question, article_title, article_text):
-    """Uses the Micro-Model as a bouncer to quickly judge if an article is useful."""
     snippet = article_text[:1000]
-    
-    # Relaxed prompt: Accept anything "related or useful" rather than perfectly answering it
     prompt = f"""You are a relevance judge. 
 Does the following Wikipedia snippet contain ANY information, definitions, or context that is related to the user's question?
 Answer ONLY with the word "YES" or "NO". Do not explain.
@@ -371,28 +367,20 @@ Snippet: {snippet}"""
             max_tokens=2 
         )
         judgment = response.choices[0].message.content.strip().upper()
-        
-        if "YES" in judgment:
-            return True
-        else:
-            return False
+        return "YES" in judgment
     except Exception as e:
         logging.warning(f"[*] Relevance Judge skipped due to error: {e}")
-        return True # Fallback to keeping it if the judge fails
+        return True
 
 def search_offline_wikipedia(ai_keywords, user_question, target_accepted=2, max_evaluations=8):
-    """Searches the database and keeps digging until it finds accepted articles or hits a timeout limit."""
     query = Query().set_query(ai_keywords)
     search_results = searcher.search(query)
     
     context_parts = []
     eval_count = 0
-    
-    # Pull a larger pool of results to draw from
     results = list(search_results.getResults(0, max_evaluations))
     
     for result in results:
-        # Stop digging if we hit our target number of good articles
         if len(context_parts) >= target_accepted:
             logging.info(f"[+] Target of {target_accepted} relevant articles met. Stopping search early.")
             break
@@ -421,10 +409,7 @@ def search_offline_wikipedia(ai_keywords, user_question, target_accepted=2, max_
     return "\n\n---\n\n".join(context_parts) if context_parts else ""
 
 def query_ai(user_question):
-    # Step 1: Micro-Model Generation
     optimized_keywords = generate_ai_search_terms(user_question)
-    
-    # Step 2: Database Search & AI Filtering
     logging.info(f"[*] Searching ZIM archive for: '{optimized_keywords}'")
     context = search_offline_wikipedia(optimized_keywords, user_question, target_accepted=2, max_evaluations=TOP_K)
     
@@ -435,7 +420,6 @@ def query_ai(user_question):
         
     prompt = f"{PRIMARY_PROMPT}\n\nCONTEXT FROM OFFLINE WIKIPEDIA:\n{context}\n\nUSER QUESTION: {user_question}"
     
-    # Step 3: Primary Model Handoff
     logging.info(f"[*] Compiling data and querying Primary Model ({PRIMARY_MODEL})...")
     try:
         response = client.chat.completions.create(
@@ -486,15 +470,36 @@ def handle_client(conn, addr):
             logging.info(f"[{addr[0]}:{addr[1]}] User asked: {raw_data}")
             conn.sendall(b"Searching index and querying AI... Please wait.\r\n")
             
-            answer = query_ai(raw_data)
+            # --- Heartbeat Keepalive Thread ---
+            ai_done = threading.Event()
+            def send_keepalive():
+                while not ai_done.wait(10.0): # Send a dot every 10 seconds
+                    try:
+                        conn.sendall(b".")
+                    except Exception:
+                        break # Socket probably closed, kill thread quietly
+
+            keepalive_thread = threading.Thread(target=send_keepalive)
+            keepalive_thread.start()
+            
+            try:
+                answer = query_ai(raw_data)
+            finally:
+                ai_done.set() # Stop the heartbeat
+                keepalive_thread.join() # Wait for thread to exit cleanly
             
             if not shutdown_event.is_set():
-                formatted_answer = "\r\n" + answer.replace('\n', '\r\n') + "\r\n\r\n> "
+                # Added \r\n at the front to drop down a line after the keepalive dots
+                formatted_answer = "\r\n\r\n" + answer.replace('\n', '\r\n') + "\r\n\r\n> "
                 conn.sendall(formatted_answer.encode('utf-8'))
             else:
                 conn.sendall(b"\r\n[Server is shutting down. Transmission aborted.]\r\n")
                 break
                 
+    except ConnectionResetError:
+        logging.info(f"[{addr[0]}:{addr[1]}] Client disconnected unexpectedly (Connection reset by peer).")
+    except BrokenPipeError:
+        logging.info(f"[{addr[0]}:{addr[1]}] Client disconnected unexpectedly (Broken pipe).")
     except Exception as e:
         logging.error(f"[{addr[0]}:{addr[1]}] Error handling connection: {e}", exc_info=True)
     finally:
@@ -537,3 +542,4 @@ def start_packet_server():
 
 if __name__ == "__main__":
     start_packet_server()
+
