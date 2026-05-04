@@ -53,14 +53,14 @@ DEFAULT_ROUTER_PROMPT = (
     " Output: Burn, First aid"
 )
 
+# UPDATED: Hardened the gag order to force internal memory usage when the wiki fails
 DEFAULT_PRIMARY_PROMPT = (
     "You are a specialized SHTF Survival Assistant operating over a low-bandwidth Emergency Packet Radio link.\n"
     " GOAL: Provide the exact, correct answer immediately, resembling a highly accurate search engine \"Featured Snippet\".\n"
     " CONSTRAINTS:\n"
-    " - SYNTHESIZE AND ENHANCE: Read the provided Wikipedia Context. Use it for factual grounding, BUT you MUST freely combine it with your own expert internal knowledge. If the text is incomplete or vague, fill in the gaps using your own training to provide a comprehensive, highly specific answer.\n"
-    " - If the Context is completely irrelevant, ignore it completely.\n"
-    " - CRITICAL GAG ORDER: DO NOT mention the provided context. NEVER say \"According to the text...\", \"Based on the provided information...\", or \"The text indicates...\".\n"
-    " - ACTIONABLE: If the user asks \"How to...\", provide specific, actionable, step-by-step instructions.\n"
+    " - SYNTHESIZE AND ENHANCE: Read the provided Wikipedia Context. If it contains the answer, use it. If the text DOES NOT contain the specific answer, you MUST use your own internal expert knowledge to answer the user's question directly.\n"
+    " - CRITICAL GAG ORDER: DO NOT mention the provided context. NEVER say \"The provided text does not contain...\" or \"According to the text\". If the text is useless, just give the answer from your own memory without apologizing.\n"
+    " - ACTIONABLE: If the user asks \"How to...\" or asks for specs, provide specific, actionable data.\n"
     " - BLUF (Bottom Line Up Front): Start IMMEDIATELY with the answer. No apologies, no conversational filler.\n"
     " - Be EXTREMELY concise. Use short bullet points."
 )
@@ -352,12 +352,20 @@ def generate_ai_search_terms(user_question):
         logging.error(f"AI Keyword Error: {e}")
         return user_question
 
-def grade_article_relevance(user_question, article_title, article_text):
-    snippet = article_text[:8000]
+def grade_article_relevance(user_question, ai_keywords, article_title, article_text):
+    # FAST PATH: If the extracted keywords match the article title, bypass the AI to save 45 seconds!
+    title_clean = article_title.lower().strip()
+    keywords_clean = ai_keywords.lower().strip()
+    
+    if title_clean in keywords_clean or keywords_clean in title_clean:
+        logging.info(f"[*] FAST PATH: Title match detected! Auto-accepting '{article_title}' instantly.")
+        return True
+
+    # Reduced from 8000 back to 3000 to prevent the micro-model from hanging on huge context
+    snippet = article_text[:3000] 
     
     prompt = f"""You are a forgiving relevance judge. 
 Look at the Article Title and the Snippet. Does this article cover the CORE SUBJECT of the user's question?
-For example, if the user asks about "Jeep JL torque specs", an article titled "Jeep Wrangler (JL)" is a PERFECT match, even if torque isn't mentioned in the snippet.
 We just need the broad background article so the primary AI can read it later. 
 Answer ONLY with the word "YES" or "NO". Do not explain.
 
@@ -400,7 +408,9 @@ def search_offline_wikipedia(ai_keywords, user_question, target_accepted=2, max_
             clean_text = re.sub(r'\n\s*\n', '\n\n', markdown_text).strip()
             
             logging.info(f"[*] Judging relevance of article {eval_count}/{max_evaluations}: '{entry.title}'...")
-            is_relevant = grade_article_relevance(user_question, entry.title, clean_text)
+            
+            # Pass ai_keywords to the judge to enable the Fast-Path
+            is_relevant = grade_article_relevance(user_question, ai_keywords, entry.title, clean_text)
             
             if is_relevant:
                 logging.info(f"[+] Article '{entry.title}' ACCEPTED.")
