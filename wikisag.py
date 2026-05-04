@@ -217,7 +217,7 @@ def run_interactive_setup():
     else:
         c_zim = ask("ZIM File Path", "wikipedia_en_all_nopic_2026-03.zim")
         
-    c_top_k = ask("Wikipedia Search Depth (Number of articles to scan)", "5")
+    c_top_k = ask("Max Search Evaluations (Max articles to dig through before timing out)", "8")
         
     print("\n--- AI Model Configuration ---")
     c_url = ask("Ollama API URL", "http://localhost:11434/v1")
@@ -303,7 +303,7 @@ HOST = config.get('Network', 'host', fallback='127.0.0.1')
 PORT = config.getint('Network', 'port', fallback=8000)
 
 ZIM_FILE_PATH = config.get('Data', 'zim_file', fallback='wikipedia_en_all_nopic_2026-03.zim')
-TOP_K = config.getint('Data', 'top_k', fallback=5)
+TOP_K = config.getint('Data', 'top_k', fallback=8) # Increased default digging depth
 if not os.path.isabs(ZIM_FILE_PATH):
     ZIM_FILE_PATH = os.path.join(BASE_DIR, ZIM_FILE_PATH)
 
@@ -351,10 +351,12 @@ def generate_ai_search_terms(user_question):
         return user_question
 
 def grade_article_relevance(user_question, article_title, article_text):
-    """Uses the Micro-Model as a bouncer to quickly judge if an article is garbage."""
+    """Uses the Micro-Model as a bouncer to quickly judge if an article is useful."""
     snippet = article_text[:1000]
-    prompt = f"""You are a strict relevance judge. 
-Does the following Wikipedia article snippet contain information that helps answer the user's question?
+    
+    # Relaxed prompt: Accept anything "related or useful" rather than perfectly answering it
+    prompt = f"""You are a relevance judge. 
+Does the following Wikipedia snippet contain ANY information, definitions, or context that is related to the user's question?
 Answer ONLY with the word "YES" or "NO". Do not explain.
 
 User Question: {user_question}
@@ -376,15 +378,26 @@ Snippet: {snippet}"""
             return False
     except Exception as e:
         logging.warning(f"[*] Relevance Judge skipped due to error: {e}")
-        return True
+        return True # Fallback to keeping it if the judge fails
 
-def search_offline_wikipedia(ai_keywords, user_question, top_k):
-    """Searches the ZIM database and passes results through the AI Bouncer."""
+def search_offline_wikipedia(ai_keywords, user_question, target_accepted=2, max_evaluations=8):
+    """Searches the database and keeps digging until it finds accepted articles or hits a timeout limit."""
     query = Query().set_query(ai_keywords)
     search_results = searcher.search(query)
     
     context_parts = []
-    for result in list(search_results.getResults(0, top_k)):
+    eval_count = 0
+    
+    # Pull a larger pool of results to draw from
+    results = list(search_results.getResults(0, max_evaluations))
+    
+    for result in results:
+        # Stop digging if we hit our target number of good articles
+        if len(context_parts) >= target_accepted:
+            logging.info(f"[+] Target of {target_accepted} relevant articles met. Stopping search early.")
+            break
+            
+        eval_count += 1
         path = result if isinstance(result, str) else result.path
         try:
             entry = zim.get_entry_by_path(path)
@@ -392,16 +405,17 @@ def search_offline_wikipedia(ai_keywords, user_question, top_k):
             markdown_text = markdownify(html_content, strip=['a', 'img', 'script', 'style'])
             clean_text = re.sub(r'\n\s*\n', '\n\n', markdown_text).strip()
             
-            logging.info(f"[*] Judging relevance of article: '{entry.title}'...")
+            logging.info(f"[*] Judging relevance of article {eval_count}/{max_evaluations}: '{entry.title}'...")
             is_relevant = grade_article_relevance(user_question, entry.title, clean_text)
             
             if is_relevant:
                 logging.info(f"[+] Article '{entry.title}' ACCEPTED.")
                 context_parts.append(f"ARTICLE TITLE: {entry.title}\n{clean_text}")
             else:
-                logging.info(f"[-] Article '{entry.title}' REJECTED (Irrelevant).")
+                logging.info(f"[-] Article '{entry.title}' REJECTED.")
                 
-        except Exception:
+        except Exception as e:
+            logging.error(f"Error reading article: {e}")
             continue
             
     return "\n\n---\n\n".join(context_parts) if context_parts else ""
@@ -412,7 +426,7 @@ def query_ai(user_question):
     
     # Step 2: Database Search & AI Filtering
     logging.info(f"[*] Searching ZIM archive for: '{optimized_keywords}'")
-    context = search_offline_wikipedia(optimized_keywords, user_question, top_k=TOP_K)
+    context = search_offline_wikipedia(optimized_keywords, user_question, target_accepted=2, max_evaluations=TOP_K)
     
     if not context:
         logging.info("[*] All retrieved articles were rejected. Forcing Primary Model to use internal memory.")
