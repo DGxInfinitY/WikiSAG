@@ -334,6 +334,12 @@ def generate_ai_search_terms(user_question):
             max_tokens=15 
         )
         keywords = response.choices[0].message.content.strip()
+        
+        # FIX: If the micro-model hallucinates an empty string, fallback to the raw query
+        if not keywords:
+            logging.warning(f"[*] Micro-Model choked. Falling back to raw query: '{user_question}'")
+            return user_question
+            
         logging.info(f"[*] Micro-Model translated '{user_question}' -> '{keywords}'")
         return keywords
     except Exception as e:
@@ -398,9 +404,20 @@ def handle_client(conn, addr):
         conn.sendall(greeting.encode('utf-8'))
         
         while not shutdown_event.is_set():
-            raw_data = conn.recv(1024).decode('utf-8').strip()
-            if not raw_data:
+            # Read the raw bytes first
+            raw_bytes = conn.recv(1024)
+            
+            # If we receive 0 bytes, the TCP connection physically dropped
+            if not raw_bytes:
                 break
+                
+            # Decode and strip
+            raw_data = raw_bytes.decode('utf-8').strip()
+            
+            # FIX: If it's just an empty string (User hit Enter), prompt them again!
+            if not raw_data:
+                conn.sendall(b"> ")
+                continue
             
             if raw_data.lower() in ['exit', 'quit', 'bye', 'disconnect']:
                 conn.sendall(b"73! Returning to node...\r\n")
