@@ -152,6 +152,27 @@ def ask(prompt_text, default_val):
     answer = input(f"{prompt_text} [{default_val}]: ").strip()
     return answer if answer else default_val
 
+def select_model_from_list(models, prompt_text, default_model):
+    if not models:
+        return ask(f"Enter {prompt_text} manually", default_model)
+        
+    print(f"\nSelect {prompt_text}:")
+    for i, m in enumerate(models, 1):
+        print(f"  {i}) {m}")
+    print(f"  0) Enter custom model name manually")
+    
+    while True:
+        choice = input(f"\nSelect a model (0-{len(models)}) [1]: ").strip()
+        if not choice:
+            return models[0]
+        elif choice.isdigit():
+            idx = int(choice)
+            if idx == 0:
+                return ask(f"Enter custom {prompt_text}", default_model)
+            elif 1 <= idx <= len(models):
+                return models[idx-1]
+        print("Invalid selection. Please enter a valid number.")
+
 def run_interactive_setup():
     print("\n" + "="*50)
     print(" WikiSAG Configuration Wizard")
@@ -171,33 +192,16 @@ def run_interactive_setup():
     else:
         c_zim = ask("ZIM File Path", "wikipedia_en_all_nopic_2026-03.zim")
         
+    c_top_k = ask("Wikipedia Search Depth (Number of articles to scan)", "5")
+        
     print("\n--- AI Model Configuration ---")
     c_url = ask("Ollama API URL", "http://localhost:11434/v1")
     
+    print("[*] Detecting installed Ollama models...")
     models = fetch_ollama_models(c_url)
-    if models:
-        print("\nAvailable Models Detected:")
-        for i, m in enumerate(models, 1):
-            print(f"  {i}) {m}")
-        print(f"  0) Enter a custom model name manually")
-        
-        while True:
-            choice = input(f"\nSelect a model (0-{len(models)}) [1]: ").strip()
-            if not choice:
-                c_model = models[0]
-                break
-            elif choice.isdigit():
-                idx = int(choice)
-                if idx == 0:
-                    c_model = ask("Enter custom Ollama Model Name", "gemma4:e2b-it-q8_0")
-                    break
-                elif 1 <= idx <= len(models):
-                    c_model = models[idx-1]
-                    break
-            print("Invalid selection. Please enter a valid number.")
-    else:
-        print("[-] Could not automatically detect models. (Ollama might not be running yet).")
-        c_model = ask("Ollama Model Name", "gemma4:e2b-it-q8_0")
+    
+    c_primary_model = select_model_from_list(models, "Primary Model (The Heavy Lifter)", "gemma4:e2b-it-q8_0")
+    c_router_model = select_model_from_list(models, "Router Model (The Speedy Extractor)", "llama3.2:1b")
         
     c_chars = ask("Max Context Characters", "15000")
     
@@ -205,15 +209,47 @@ def run_interactive_setup():
     svc_ans = ask("Run as background systemd service? (yes/no)", "yes").lower()
     c_svc = 'yes' if svc_ans in ['y', 'yes', 'true'] else 'no'
 
+    # Default Prompts (Formatted with leading spaces for INI multi-line support)
+    default_router_prompt = (
+        "You are a search query generator.\n"
+        " Convert the user's question into 1 or 2 highly specific Wikipedia search terms.\n"
+        " If it is a medical question, add \"(injury)\" or \"medical\" to the term.\n"
+        " DO NOT answer the question. ONLY output the search terms. No punctuation."
+    )
+    
+    default_primary_prompt = (
+        "You are a specialized Knowledge Retrieval Assistant operating over a low-bandwidth Emergency Packet Radio link.\n"
+        " GOAL: Provide the exact, correct answer immediately, resembling a highly accurate search engine \"Featured Snippet\".\n"
+        " CONSTRAINTS:\n"
+        " - Evaluate the provided Wikipedia Context. If it contains the answer, use it.\n"
+        " - If the Context is irrelevant to the question, IGNORE IT entirely and use your internal knowledge.\n"
+        " - CRITICAL GAG ORDER: DO NOT mention the provided context. NEVER say \"According to the text...\" or \"The provided text does not contain...\".\n"
+        " - BLUF (Bottom Line Up Front): Start your response IMMEDIATELY with the most direct, factual answer.\n"
+        " - No apologies, no conversational filler, no greetings.\n"
+        " - Be EXTREMELY concise. Use short bullet points for steps or data."
+    )
+
     config = configparser.ConfigParser()
     config['System'] = {'run_as_service': c_svc}
     config['Network'] = {'host': c_host, 'port': c_port}
-    config['Ollama'] = {'base_url': c_url, 'model': c_model, 'max_context_chars': c_chars}
-    config['Data'] = {'zim_file': c_zim}
+    config['Data'] = {'zim_file': c_zim, 'top_k': c_top_k}
+    config['Ollama'] = {
+        'base_url': c_url, 
+        'primary_model': c_primary_model, 
+        'router_model': c_router_model,
+        'max_context_chars': c_chars
+    }
+    config['Prompts'] = {
+        'router_system_prompt': default_router_prompt,
+        'primary_system_prompt': default_primary_prompt
+    }
     
     with open(CONFIG_FILE, 'w') as configfile:
         config.write(configfile)
+        
     print(f"\n[+] Configuration saved to {CONFIG_FILE}!")
+    print(f"[*] Note: Advanced AI behavior prompts have been loaded with SHTF defaults.")
+    print(f"    You can fine-tune the AI's personality anytime by editing {CONFIG_FILE}")
 
     enforce_service_state(c_svc == 'yes', start_immediately=False)
 
@@ -238,7 +274,7 @@ def validate_config():
     config = configparser.ConfigParser()
     try:
         config.read(CONFIG_FILE)
-        return all(s in config for s in ['System', 'Network', 'Ollama', 'Data'])
+        return all(s in config for s in ['System', 'Network', 'Ollama', 'Data', 'Prompts'])
     except configparser.Error:
         return False
 
@@ -253,22 +289,28 @@ if not validate_config() or force_config:
     else:
         sys.exit(1)
 
+# Load global configurations
 config = configparser.ConfigParser()
 config.read(CONFIG_FILE)
 
 RUN_AS_SERVICE = config.getboolean('System', 'run_as_service', fallback=False)
 HOST = config.get('Network', 'host', fallback='127.0.0.1')
 PORT = config.getint('Network', 'port', fallback=8000)
-OLLAMA_URL = config.get('Ollama', 'base_url', fallback='http://localhost:11434/v1')
-MODEL = config.get('Ollama', 'model', fallback='gemma4:e2b-it-q8_0')
-MAX_CHARS = config.getint('Ollama', 'max_context_chars', fallback=15000)
-ZIM_FILE_PATH = config.get('Data', 'zim_file', fallback='wikipedia_en_all_nopic_2026-03.zim')
 
+ZIM_FILE_PATH = config.get('Data', 'zim_file', fallback='wikipedia_en_all_nopic_2026-03.zim')
+TOP_K = config.getint('Data', 'top_k', fallback=5)
 if not os.path.isabs(ZIM_FILE_PATH):
     ZIM_FILE_PATH = os.path.join(BASE_DIR, ZIM_FILE_PATH)
 
-enforce_service_state(RUN_AS_SERVICE, start_immediately=True)
+OLLAMA_URL = config.get('Ollama', 'base_url', fallback='http://localhost:11434/v1')
+PRIMARY_MODEL = config.get('Ollama', 'primary_model', fallback='gemma4:e2b-it-q8_0')
+ROUTER_MODEL = config.get('Ollama', 'router_model', fallback='llama3.2:1b')
+MAX_CHARS = config.getint('Ollama', 'max_context_chars', fallback=15000)
 
+ROUTER_PROMPT = config.get('Prompts', 'router_system_prompt', fallback="")
+PRIMARY_PROMPT = config.get('Prompts', 'primary_system_prompt', fallback="")
+
+enforce_service_state(RUN_AS_SERVICE, start_immediately=True)
 client = OpenAI(base_url=OLLAMA_URL, api_key='ollama')
 
 try:
@@ -280,14 +322,30 @@ except Exception as e:
     logging.error(f"CRITICAL ERROR: Could not load ZIM file: {e}")
     sys.exit(1)
 
-# --- Core RAG Logic ---
-def search_offline_wikipedia(user_query, top_k=3):
-    """Searches for multiple articles to increase the chance of a relevant hit."""
-    query = Query().set_query(user_query)
+# --- Agentic RAG Logic ---
+def generate_ai_search_terms(user_question):
+    """Uses the Micro-Model to translate a human question into keywords."""
+    prompt = f"{ROUTER_PROMPT}\n\nQuestion: {user_question}"
+    try:
+        response = client.chat.completions.create(
+            model=ROUTER_MODEL, 
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0, 
+            max_tokens=15 
+        )
+        keywords = response.choices[0].message.content.strip()
+        logging.info(f"[*] Micro-Model translated '{user_question}' -> '{keywords}'")
+        return keywords
+    except Exception as e:
+        logging.error(f"AI Keyword Error: {e}")
+        return user_question
+
+def search_offline_wikipedia(ai_keywords, top_k):
+    """Searches the ZIM database using dynamic top_k depth."""
+    query = Query().set_query(ai_keywords)
     search_results = searcher.search(query)
     
     context_parts = []
-    # Pulling top_k results instead of just 1
     for result in list(search_results.getResults(0, top_k)):
         path = result if isinstance(result, str) else result.path
         try:
@@ -296,54 +354,35 @@ def search_offline_wikipedia(user_query, top_k=3):
             markdown_text = markdownify(html_content, strip=['a', 'img', 'script', 'style'])
             clean_text = re.sub(r'\n\s*\n', '\n\n', markdown_text).strip()
             context_parts.append(f"ARTICLE TITLE: {entry.title}\n{clean_text}")
-        except Exception as e:
-            logging.error(f"Error parsing ZIM entry: {e}")
+        except Exception:
             continue
             
-    return "\n\n---\n\n".join(context_parts) if context_parts else "No relevant articles found in index."
+    return "\n\n---\n\n".join(context_parts) if context_parts else "No relevant articles found."
 
 def query_ai(user_question):
-    # Grab the top 3 articles to give the AI more context
-    context = search_offline_wikipedia(user_question, top_k=3)
+    optimized_keywords = generate_ai_search_terms(user_question)
+    context = search_offline_wikipedia(optimized_keywords, top_k=TOP_K)
     
     if len(context) > MAX_CHARS:
         context = context[:MAX_CHARS] + "... [Context Truncated]"
         
-    # Overhauled System Prompt for SHTF/Survival Utility
-    prompt = f"""You are a specialized SHTF Survival Assistant operating over a low-bandwidth Emergency Packet Radio link.
-
-GOAL: Provide immediate, actionable, and life-saving information.
-
-CONSTRAINTS:
-- Evaluate the provided Wikipedia Context. If it contains the answer, use it.
-- Ignore irrelevant articles (e.g., movies, songs, unrelated history).
-- If the Wikipedia Context is missing or irrelevant, rely entirely on your internal knowledge to answer the user safely and accurately.
-- Be EXTREMELY concise. Use short bullet points for steps.
-- Do NOT use conversational filler (no "I hope this helps", "Based on the text", or "Here is how to..."). Start immediately with the facts.
-- If the query is medical, include a brief "Seek professional medical help if possible" warning at the end.
-
-CONTEXT FROM OFFLINE WIKIPEDIA:
-{context}
-
-USER QUESTION: {user_question}
-"""
-
+    prompt = f"{PRIMARY_PROMPT}\n\nCONTEXT FROM OFFLINE WIKIPEDIA:\n{context}\n\nUSER QUESTION: {user_question}"
+    
     try:
         response = client.chat.completions.create(
-            model=MODEL,
+            model=PRIMARY_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
         )
         return response.choices[0].message.content
     except Exception as e:
         logging.error(f"AI Query Error: {e}")
-        return "Error: Could not reach the local AI model. Check Ollama."
+        return "Error: Could not reach the local AI model."
 
 # --- Packet Network Server ---
 def handle_client(conn, addr):
     logging.info(f"[{addr[0]}:{addr[1]}] Connection established.")
     try:
-        # Professional Packet Greeting & Instructions
         greeting = (
             "\r\n"
             "*** Offline Wiki Assistant ***\r\n"
@@ -358,13 +397,11 @@ def handle_client(conn, addr):
         )
         conn.sendall(greeting.encode('utf-8'))
         
-        # Loop to catch questions or "EXIT" commands
         while not shutdown_event.is_set():
             raw_data = conn.recv(1024).decode('utf-8').strip()
             if not raw_data:
                 break
             
-            # Check for exit keywords
             if raw_data.lower() in ['exit', 'quit', 'bye', 'disconnect']:
                 conn.sendall(b"73! Returning to node...\r\n")
                 break
