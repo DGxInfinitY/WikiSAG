@@ -281,33 +281,73 @@ except Exception as e:
     sys.exit(1)
 
 # --- Core RAG Logic ---
-def search_offline_wikipedia(user_query, top_k=1):
+def search_offline_wikipedia(user_query, top_k=3):
+    """Searches for multiple articles to increase the chance of a relevant hit."""
     query = Query().set_query(user_query)
     search_results = searcher.search(query)
-    context = ""
+    
+    context_parts = []
+    # Pulling top_k results instead of just 1
     for result in list(search_results.getResults(0, top_k)):
         path = result if isinstance(result, str) else result.path
-        entry = zim.get_entry_by_path(path)
-        html_content = bytes(entry.get_item().content).decode("UTF-8")
-        markdown_text = markdownify(html_content, strip=['a', 'img', 'script', 'style'])
-        clean_text = re.sub(r'\n\s*\n', '\n\n', markdown_text).strip()
-        context += f"Title: {entry.title}\n{clean_text}\n\n---\n\n"
-    return context if context else "No relevant offline Wikipedia articles found."
+        try:
+            entry = zim.get_entry_by_path(path)
+            html_content = bytes(entry.get_item().content).decode("UTF-8")
+            markdown_text = markdownify(html_content, strip=['a', 'img', 'script', 'style'])
+            clean_text = re.sub(r'\n\s*\n', '\n\n', markdown_text).strip()
+            context_parts.append(f"ARTICLE TITLE: {entry.title}\n{clean_text}")
+        except Exception as e:
+            logging.error(f"Error parsing ZIM entry: {e}")
+            continue
+            
+    return "\n\n---\n\n".join(context_parts) if context_parts else "No relevant articles found in index."
 
 def query_ai(user_question):
-    context = search_offline_wikipedia(user_question, top_k=1)
+    # Grab the top 3 articles to give the AI more context
+    context = search_offline_wikipedia(user_question, top_k=3)
+    
     if len(context) > MAX_CHARS:
-        context = context[:MAX_CHARS] + "... [Article Truncated]"
-    prompt = f"You are a helpful offline assistant. Use the following context to answer briefly: {context}\nQuestion: {user_question}"
-    response = client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": prompt}], temperature=0.1)
-    return response.choices[0].message.content
+        context = context[:MAX_CHARS] + "... [Context Truncated]"
+        
+    # Overhauled System Prompt for SHTF/Survival Utility
+    prompt = f"""You are a specialized SHTF Survival Assistant operating over a low-bandwidth Emergency Packet Radio link.
+
+GOAL: Provide immediate, actionable, and life-saving information.
+
+CONSTRAINTS:
+- Evaluate the provided Wikipedia Context. If it contains the answer, use it.
+- Ignore irrelevant articles (e.g., movies, songs, unrelated history).
+- If the Wikipedia Context is missing or irrelevant, rely entirely on your internal knowledge to answer the user safely and accurately.
+- Be EXTREMELY concise. Use short bullet points for steps.
+- Do NOT use conversational filler (no "I hope this helps", "Based on the text", or "Here is how to..."). Start immediately with the facts.
+- If the query is medical, include a brief "Seek professional medical help if possible" warning at the end.
+
+CONTEXT FROM OFFLINE WIKIPEDIA:
+{context}
+
+USER QUESTION: {user_question}
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logging.error(f"AI Query Error: {e}")
+        return "Error: Could not reach the local AI model. Check Ollama."
 
 # --- Packet Network Server ---
 def handle_client(conn, addr):
     logging.info(f"[{addr[0]}:{addr[1]}] Connection established.")
     try:
+        # Professional Packet Greeting & Instructions
         greeting = (
-            "\r\n*** Offline Wiki Assistant ***\r\n"
+            "\r\n"
+            "*** Offline Wiki Assistant ***\r\n"
+            "Query the 52GB Wikipedia archive via local AI.\r\n"
             "----------------------------------------------\r\n"
             "INSTRUCTIONS:\r\n"
             " - Type a specific question (e.g., 'How to treat a burn?')\r\n"
@@ -318,22 +358,34 @@ def handle_client(conn, addr):
         )
         conn.sendall(greeting.encode('utf-8'))
         
+        # Loop to catch questions or "EXIT" commands
         while not shutdown_event.is_set():
             raw_data = conn.recv(1024).decode('utf-8').strip()
             if not raw_data:
                 break
+            
+            # Check for exit keywords
             if raw_data.lower() in ['exit', 'quit', 'bye', 'disconnect']:
                 conn.sendall(b"73! Returning to node...\r\n")
                 break
+                
             logging.info(f"[{addr[0]}:{addr[1]}] User asked: {raw_data}")
             conn.sendall(b"Searching index and querying AI... Please wait.\r\n")
+            
             answer = query_ai(raw_data)
-            formatted_answer = "\r\n" + answer.replace('\n', '\r\n') + "\r\n\r\n> "
-            conn.sendall(formatted_answer.encode('utf-8'))
+            
+            if not shutdown_event.is_set():
+                formatted_answer = "\r\n" + answer.replace('\n', '\r\n') + "\r\n\r\n> "
+                conn.sendall(formatted_answer.encode('utf-8'))
+            else:
+                conn.sendall(b"\r\n[Server is shutting down. Transmission aborted.]\r\n")
+                break
+                
     except Exception as e:
-        logging.error(f"[{addr[0]}:{addr[1]}] Error: {e}")
+        logging.error(f"[{addr[0]}:{addr[1]}] Error handling connection: {e}", exc_info=True)
     finally:
         conn.close()
+        logging.info(f"[{addr[0]}:{addr[1]}] Connection closed.")
 
 def start_packet_server():
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -341,14 +393,33 @@ def start_packet_server():
     server_socket.bind((HOST, PORT))
     server_socket.settimeout(1.0)
     server_socket.listen(5)
+    
     logging.info(f"WikiSAG Server listening on {HOST}:{PORT}...")
+    
     while not shutdown_event.is_set():
         try:
             conn, addr = server_socket.accept()
-            threading.Thread(target=handle_client, args=(conn, addr)).start()
+            client_thread = threading.Thread(target=handle_client, args=(conn, addr))
+            client_thread.start()
+            active_threads.append(client_thread)
+            active_threads[:] = [t for t in active_threads if t.is_alive()]
+            
         except socket.timeout:
             continue
+        except Exception as e:
+            if not shutdown_event.is_set():
+                logging.error(f"Socket error: {e}")
+    
+    logging.info("\n[*] Stop signal received. Closing main server socket...")
     server_socket.close()
+    
+    if active_threads:
+        logging.info(f"[*] Waiting for {len(active_threads)} active query thread(s) to finish...")
+        for t in active_threads:
+            t.join(timeout=5.0)
+            
+    logging.info("[+] Shutdown complete. 73!")
+    sys.exit(0)
 
 if __name__ == "__main__":
     start_packet_server()
